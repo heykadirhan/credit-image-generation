@@ -13,6 +13,7 @@ export interface Model {
   label: string;
   pricingVersion: number;
   providers: readonly Provider[];
+  promptRequired: boolean;
   minInputImages: number;
   maxInputImages: number;
   medianSeconds: number;

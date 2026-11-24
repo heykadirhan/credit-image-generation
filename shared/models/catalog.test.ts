@@ -1,21 +1,20 @@
 import { describe, expect, test } from "vitest";
-import { findModel, photoreal, sketchRender } from "./catalog";
+import { models, render, upscale } from "./catalog";
 
-describe("photoreal pricing", () => {
+describe("render pricing", () => {
   test.each([
-    [{}, 4],
-    [{ quality: "draft" }, 2],
-    [{ quality: "high" }, 8],
-    [{ resolution: "2k" }, 6],
-    [{ quality: "high", resolution: "4k" }, 14],
-    [{ quality: "high", resolution: "4k", count: 4 }, 56],
+    [{}, 1],
+    [{ quality: "high" }, 2],
+    [{ resolution: "2k" }, 2],
+    [{ quality: "high", resolution: "4k" }, 5],
+    [{ quality: "high", resolution: "4k", count: 4 }, 20],
   ])("%o costs %i credits", (params, credits) => {
-    const quote = photoreal.quote(params);
+    const quote = render.quote(params);
     expect(quote.ok && quote.priceCredits).toBe(credits);
   });
 
   test("fills defaults into the stored params", () => {
-    const quote = photoreal.quote({});
+    const quote = render.quote({});
     expect(quote.ok && quote.params).toEqual({
       quality: "standard",
       resolution: "1k",
@@ -25,30 +24,33 @@ describe("photoreal pricing", () => {
   });
 });
 
-describe("sketch-render pricing", () => {
+describe("upscale pricing", () => {
   test.each([
-    [{}, 3],
-    [{ resolution: "2k" }, 5],
-    [{ resolution: "2k", count: 3 }, 15],
+    [{}, 5],
+    [{ factor: "4x" }, 10],
   ])("%o costs %i credits", (params, credits) => {
-    const quote = sketchRender.quote(params);
+    const quote = upscale.quote(params);
     expect(quote.ok && quote.priceCredits).toBe(credits);
+  });
+
+  test("always makes one image", () => {
+    expect(upscale.quote({ count: 2 }).ok).toBe(false);
   });
 });
 
 describe("params validation", () => {
   test.each([
-    ["an unknown param", { style: "clay" }],
+    ["a param from another model", { factor: "2x" }],
     ["a value outside the enum", { resolution: "8k" }],
     ["too many images", { count: 5 }],
     ["a fractional count", { count: 1.5 }],
-  ])("rejects %s", (_, params) => {
-    expect(photoreal.quote(params).ok).toBe(false);
+  ])("render rejects %s", (_, params) => {
+    expect(render.quote(params).ok).toBe(false);
   });
 
-  test("every model's prices are whole numbers", () => {
-    for (const id of ["photoreal", "sketch-render"]) {
-      const quote = findModel(id)!.quote({});
+  test("every model's default price is a whole number", () => {
+    for (const model of models) {
+      const quote = model.quote({});
       expect(quote.ok && Number.isInteger(quote.priceCredits)).toBe(true);
     }
   });

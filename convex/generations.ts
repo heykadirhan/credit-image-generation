@@ -1,17 +1,13 @@
 import { v } from "convex/values";
 import type { Model } from "../shared/models/define";
 import { findModel } from "../shared/models/catalog";
-import {
-  GENERATION_DEADLINE_MS,
-  MAX_ACTIVE_PER_USER,
-  MAX_OPEN_PER_USER,
-  MAX_PROMPT_LENGTH,
-} from "../shared/limits";
-import { internal } from "./_generated/api";
-import type { Id } from "./_generated/dataModel";
+import { GENERATION_DEADLINE_MS, MAX_PROMPT_LENGTH } from "../shared/limits";
+import type { Doc, Id } from "./_generated/dataModel";
 import { mutation, type QueryCtx } from "./_generated/server";
-import { requireUser } from "./lib/auth";
+import { requireMember } from "./lib/auth";
+import { applyLedgerEntryOnce } from "./lib/credits";
 import { fail } from "./lib/errors";
+import { limitsFor, openGenerations, promoteWaiting, scheduleRun } from "./lib/queue";
 import { generationStatus, paramsValidator } from "./schema";
 
 type Reader = Pick<QueryCtx, "db">;
@@ -32,7 +28,7 @@ export const submitGeneration = mutation({
     balanceAfter: v.number(),
   }),
   handler: async (ctx, args) => {
-    const user = await requireUser(ctx);
+    const { user, workspace } = await requireMember(ctx);
 
     const previous = await ctx.db
       .query("generations")
@@ -45,37 +41,41 @@ export const submitGeneration = mutation({
         generationId: previous._id,
         status: previous.status,
         priceCredits: previous.priceCredits,
-        balanceAfter: user.creditBalance,
+        balanceAfter: workspace.creditBalance,
       };
     }
 
     const model = findModel(args.modelId);
     if (!model) fail("UNKNOWN_MODEL");
-    if (!(await isAvailable(ctx, model))) fail("MODEL_UNAVAILABLE");
+    if (!(await isAvailable(ctx, model, workspace))) fail("MODEL_UNAVAILABLE");
 
     const quote = model.quote(args.params);
     if (!quote.ok) fail("INVALID_PARAMS", { issues: quote.issues });
 
     const prompt = args.prompt.trim();
-    if (prompt.length === 0 || prompt.length > MAX_PROMPT_LENGTH) fail("INVALID_PROMPT");
+    if ((model.promptRequired && prompt.length === 0) || prompt.length > MAX_PROMPT_LENGTH) {
+      fail("INVALID_PROMPT");
+    }
 
-    await assertUsableUploads(ctx, user._id, args.inputUploadIds, model);
+    await assertUsableUploads(ctx, workspace._id, args.inputUploadIds, model);
 
     if (quote.priceCredits !== args.expectedPriceCredits) {
       fail("PRICE_CHANGED", { priceCredits: quote.priceCredits });
     }
-    // A parallel submit reads this same balance, so Convex reruns one of them against the new value.
-    if (user.creditBalance < quote.priceCredits) {
+    // A parallel submit from the same workspace reads this same balance, so Convex reruns one of them.
+    if (workspace.creditBalance < quote.priceCredits) {
       fail("INSUFFICIENT_CREDITS", {
         priceCredits: quote.priceCredits,
-        balance: user.creditBalance,
+        balance: workspace.creditBalance,
       });
     }
 
-    const status = await admissionStatus(ctx, user._id);
-    const now = Date.now();
+    await promoteWaiting(ctx, workspace);
+    const status = await admissionStatus(ctx, workspace);
+    const deadlineAt = status === "queued" ? Date.now() + GENERATION_DEADLINE_MS : undefined;
 
     const generationId = await ctx.db.insert("generations", {
+      workspaceId: workspace._id,
       userId: user._id,
       clientRequestId: args.clientRequestId,
       modelId: model.id,
@@ -85,49 +85,76 @@ export const submitGeneration = mutation({
       inputUploadIds: args.inputUploadIds,
       imagesRequested: quote.images,
       priceCredits: quote.priceCredits,
+      priority: limitsFor(workspace).priority,
       status,
       attempt: 0,
       outputs: [],
-      deadlineAt: status === "queued" ? now + GENERATION_DEADLINE_MS : undefined,
+      deadlineAt,
     });
 
-    const balanceAfter = user.creditBalance - quote.priceCredits;
-    await ctx.db.patch(user._id, { creditBalance: balanceAfter });
-    await ctx.db.insert("creditLedger", {
-      userId: user._id,
-      amount: -quote.priceCredits,
-      kind: "generation_debit",
-      generationId,
-      ref: `generation:${generationId}:debit`,
-    });
-
-    if (status === "queued") {
-      await ctx.scheduler.runAfter(0, internal.runner.start, { generationId });
+    let balanceAfter = workspace.creditBalance;
+    if (quote.priceCredits > 0) {
+      const debit = await applyLedgerEntryOnce(ctx, {
+        workspaceId: workspace._id,
+        userId: user._id,
+        amount: -quote.priceCredits,
+        kind: "generation_debit",
+        generationId,
+        ref: `generation:${generationId}:debit`,
+      });
+      if (debit.applied) balanceAfter = debit.balanceAfter;
     }
+
+    if (deadlineAt !== undefined) await scheduleRun(ctx, generationId, deadlineAt);
 
     return { generationId, status, priceCredits: quote.priceCredits, balanceAfter };
   },
 });
 
-async function isAvailable(ctx: Reader, model: Model) {
-  if (await isSwitchedOff(ctx, `model:${model.id}`)) return false;
+export const cancelGeneration = mutation({
+  args: { generationId: v.id("generations") },
+  returns: v.union(v.literal("cancelled"), v.literal("too_late")),
+  handler: async (ctx, { generationId }) => {
+    const { user, workspace } = await requireMember(ctx);
+    const generation = await ctx.db.get(generationId);
+    if (!generation || generation.workspaceId !== workspace._id) fail("NOT_FOUND");
+    if (generation.status !== "waiting") return "too_late";
+
+    await ctx.db.patch(generationId, { status: "cancelled", finishedAt: Date.now() });
+    if (generation.priceCredits > 0) {
+      await applyLedgerEntryOnce(ctx, {
+        workspaceId: workspace._id,
+        userId: user._id,
+        amount: generation.priceCredits,
+        kind: "generation_refund",
+        generationId,
+        ref: `generation:${generationId}:refund`,
+      });
+    }
+    return "cancelled";
+  },
+});
+
+async function isAvailable(ctx: Reader, model: Model, workspace: Doc<"workspaces">) {
+  if (!(await isSwitchedOn(ctx, `model:${model.id}`, workspace))) return false;
   for (const provider of model.providers) {
-    if (!(await isSwitchedOff(ctx, `provider:${provider}`))) return true;
+    if (await isSwitchedOn(ctx, `provider:${provider}`, workspace)) return true;
   }
   return false;
 }
 
-async function isSwitchedOff(ctx: Reader, key: string) {
+async function isSwitchedOn(ctx: Reader, key: string, workspace: Doc<"workspaces">) {
   const flag = await ctx.db
     .query("modelFlags")
     .withIndex("by_key", (q) => q.eq("key", key))
     .unique();
-  return flag?.enabled === false;
+  if (!flag || flag.state === "on") return true;
+  return flag.state === "internal" && workspace.isInternal === true;
 }
 
 async function assertUsableUploads(
   ctx: Reader,
-  userId: Id<"users">,
+  workspaceId: Id<"workspaces">,
   uploadIds: Id<"uploads">[],
   model: Model,
 ) {
@@ -138,33 +165,17 @@ async function assertUsableUploads(
   if (new Set(uploadIds).size !== count) fail("INVALID_INPUT_IMAGES");
   for (const uploadId of uploadIds) {
     const upload = await ctx.db.get(uploadId);
-    if (!upload || upload.userId !== userId) fail("INVALID_INPUT_IMAGES");
+    if (!upload || upload.workspaceId !== workspaceId) fail("INVALID_INPUT_IMAGES");
   }
 }
 
 async function admissionStatus(
   ctx: Reader,
-  userId: Id<"users">,
+  workspace: Doc<"workspaces">,
 ): Promise<"queued" | "waiting"> {
-  const active =
-    (await countWithStatus(ctx, userId, "queued", MAX_ACTIVE_PER_USER)) +
-    (await countWithStatus(ctx, userId, "running", MAX_ACTIVE_PER_USER));
-  const waiting = await countWithStatus(ctx, userId, "waiting", MAX_OPEN_PER_USER);
-
-  if (active < MAX_ACTIVE_PER_USER && waiting === 0) return "queued";
-  if (active + waiting < MAX_OPEN_PER_USER) return "waiting";
-  fail("TOO_MANY_PENDING", { limit: MAX_OPEN_PER_USER });
-}
-
-async function countWithStatus(
-  ctx: Reader,
-  userId: Id<"users">,
-  status: "waiting" | "queued" | "running",
-  cap: number,
-) {
-  const rows = await ctx.db
-    .query("generations")
-    .withIndex("by_user_status", (q) => q.eq("userId", userId).eq("status", status))
-    .take(cap);
-  return rows.length;
+  const { atOnce, inBackground } = limitsFor(workspace);
+  const { active, waiting } = await openGenerations(ctx, workspace);
+  if (active < atOnce && waiting === 0) return "queued";
+  if (active + waiting < inBackground) return "waiting";
+  fail("TOO_MANY_PENDING", { limit: inBackground });
 }

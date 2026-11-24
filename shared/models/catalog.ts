@@ -1,48 +1,46 @@
 import { z } from "zod";
 import { defineModel, type Model } from "./define";
 
-const count = z.number().int().min(1).max(4).default(1);
+const renderQualityCredits = { standard: 1, high: 2 } as const;
+const renderResolutionCredits = { "1k": 0, "2k": 1, "4k": 3 } as const;
+const upscaleFactorCredits = { "2x": 5, "4x": 10 } as const;
 
-const photorealQualityCredits = { draft: 2, standard: 4, high: 8 } as const;
-const photorealResolutionCredits = { "1k": 0, "2k": 2, "4k": 6 } as const;
-const sketchResolutionCredits = { "1k": 3, "2k": 5 } as const;
-
-export const photoreal = defineModel({
-  id: "photoreal",
-  label: "Photoreal",
+export const render = defineModel({
+  id: "render",
+  label: "Render",
   pricingVersion: 1,
   providers: ["fal", "replicate"],
+  promptRequired: true,
   minInputImages: 0,
   maxInputImages: 4,
   medianSeconds: 25,
   params: z.strictObject({
-    quality: z.enum(["draft", "standard", "high"]).default("standard"),
+    quality: z.enum(["standard", "high"]).default("standard"),
     resolution: z.enum(["1k", "2k", "4k"]).default("1k"),
     aspectRatio: z.enum(["1:1", "4:3", "3:2", "16:9"]).default("4:3"),
-    count,
+    count: z.number().int().min(1).max(4).default(1),
   }),
   pricePerImage: ({ quality, resolution }) =>
-    photorealQualityCredits[quality] + photorealResolutionCredits[resolution],
+    renderQualityCredits[quality] + renderResolutionCredits[resolution],
 });
 
-export const sketchRender = defineModel({
-  id: "sketch-render",
-  label: "Sketch to render",
+export const upscale = defineModel({
+  id: "upscale",
+  label: "Upscale",
   pricingVersion: 1,
-  providers: ["own-gpu"],
+  providers: ["own-gpu", "fal"],
+  promptRequired: false,
   minInputImages: 1,
   maxInputImages: 1,
-  medianSeconds: 12,
+  medianSeconds: 40,
   params: z.strictObject({
-    style: z.enum(["photoreal", "watercolor", "clay", "line"]).default("photoreal"),
-    sketchStrength: z.number().min(0).max(1).default(0.6),
-    resolution: z.enum(["1k", "2k"]).default("1k"),
-    count,
+    factor: z.enum(["2x", "4x"]).default("2x"),
+    count: z.literal(1).default(1),
   }),
-  pricePerImage: ({ resolution }) => sketchResolutionCredits[resolution],
+  pricePerImage: ({ factor }) => upscaleFactorCredits[factor],
 });
 
-export const models: readonly Model[] = [photoreal, sketchRender];
+export const models: readonly Model[] = [render, upscale];
 
 export function findModel(id: string): Model | undefined {
   return models.find((model) => model.id === id);

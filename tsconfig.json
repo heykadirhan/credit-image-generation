@@ -12,5 +12,5 @@
     "noEmit": true,
     "types": ["node", "vite/client"]
   },
-  "include": ["convex", "shared", "vitest.config.ts"]
+  "include": ["convex", "shared", "tests", "vitest.config.ts"]
 }

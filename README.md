@@ -1,234 +1,249 @@
 # Credit-based image generation: build plan
 
-This is my plan for the feature in the Rendair case brief, written for the teammate who would build it. The plan is this README. The function I think matters most, `submitGeneration`, is real code in [`convex/generations.ts`](convex/generations.ts), with the pricing it depends on in [`shared/models/`](shared/models) and tests next to both.
+This is my plan for the feature in the Rendair case brief, written for the teammate who would build it. The brief asks for one function in real code. I wrote `submitGeneration` ([`convex/generations.ts`](convex/generations.ts)) and also `settleGeneration` ([`convex/settle.ts`](convex/settle.ts)), because submit schedules it and the refund rule lives there. Both deploy to Convex and have tests.
 
 ```bash
 npm install
-npm test           # 27 tests: pricing tables and every rule in submitGeneration
+npm test               # 41 tests: pricing, submit, settle, cancel, ledger
 npm run typecheck
+npm run convex:local   # pushes to a local Convex backend, no account needed
 ```
+
+## In short
+
+- A workspace owns one credit balance shared by its members and by every tool. Renewals, extra seats and top-ups add to it, and nothing expires.
+- Submit is one transaction. It checks the price the user saw, takes the credits, and schedules both the run and a deadline check. A generation can't keep credits without finishing or being refunded.
+- Plan limits come from Rendair's pricing: renders at once (1 / 4 / 4) and jobs in the background (4 / 8 / 12). Jobs over the first limit wait in line; Pro and up go first when providers are busy.
+- For models our GPUs serve, they take the job first and external providers take the overflow. Each provider has its own concurrency limit.
+- Every credit movement is a ledger entry with a unique reference, so a repeated webhook can't grant or refund twice.
 
 ## 0. Assumptions
 
-The brief leaves these open on purpose. I picked one answer for each; changing any of them doesn't change the architecture.
+These follow rendair.ai/pricing where it says something, and are my choices where it doesn't.
 
-1. Credits belong to a user. Team pools can come later; they only change who owns the balance.
-2. Credits are whole numbers, and the server computes every price. The client shows a preview from the same code.
-3. One generation asks for 1 to 4 images. The price is per image, and images that don't come back are refunded.
-4. "A result they didn't get" means we didn't store a finished image. Provider errors, timeouts, safety refusals and a failed copy to our storage all count, and all refund. "I don't like the image" is a support case; support can add an `adjustment` entry to the ledger.
-5. Buying credits already exists. The Stripe webhook adds a `purchase` entry to the same ledger described here.
-6. A user can have 4 generations running and 20 more waiting. This protects provider rate limits and our GPUs. The numbers are placeholders that plans can change later.
-7. A generation that hasn't finished 5 minutes after it starts has failed. That is twice the slowest normal run. A result that arrives after that is ignored.
-8. Input images are uploaded before submit: at most 4 per generation, 20 MB each, JPEG, PNG or WebP.
+1. Credits belong to the workspace. Members share them, and so do all tools ("credits are shared across every app"). The free plan gets Starter's limits.
+2. Renewals add the plan's credits to what is left. Extra seats add 500 each. Top-ups can be bought any time. Since nothing expires, one balance is enough; if plan credits ever expire, the ledger gets lots with expiry dates.
+3. Credits are whole numbers and the server sets every price. Text-to-image is free on Rendair, so a price of 0 is valid: it goes through the same limits and writes no ledger entry.
+4. A user hasn't "got a result" until a finished image is stored in our bucket. Provider errors, safety refusals, timeouts and a failed copy all refund. "I don't like the image" goes to support, who can add an `adjustment`.
+5. A generation asks for 1 to 4 images, priced per image. Images that don't arrive are refunded one by one.
+6. A generation that hasn't finished 5 minutes after it starts has failed. That is twice the slowest normal run. A result that arrives later is discarded.
+7. Uploads are JPEG, PNG or WebP, at most 4 per generation, resized in the browser before upload.
 
 ## 1. How it works
-
-The user picks a model and its parameters and sees the exact price on the Generate button. Submit is one transaction: it checks everything, takes the credits, creates the generation and schedules the work. A background action sends the job to the first healthy provider. When the provider calls back, a second transaction finishes the generation, and if it failed, the same transaction gives the credits back. The page subscribes to the user's generations and balance, so every change appears on screen without polling.
 
 ```mermaid
 sequenceDiagram
   participant B as Browser (Next.js)
-  participant M as Convex mutation
-  participant A as Convex action
-  participant P as Provider / own GPU
-  participant W as Webhook (Convex HTTP)
+  participant M as Convex mutations
+  participant A as Convex actions
+  participant P as Own GPU / provider
   participant R as R2
-  B->>R: upload input images (presigned URL)
+  B->>R: upload resized inputs (presigned URL)
   B->>M: submitGeneration(clientRequestId, model, params, expectedPrice)
-  M->>M: validate, price, debit, insert generation, schedule run
-  M-->>B: generationId (UI already updated through the subscription)
-  M->>A: runner.start(generationId)
-  A->>P: start job (webhook URL)
-  A->>M: markRunning(externalJobId)
-  P->>W: result or failure
-  W->>A: copy outputs
-  A->>R: store output images
-  A->>M: settle(generationId, attempt, outcome)
-  M->>M: succeeded, or failed + refund, then start the next waiting job
+  M->>M: check, price, debit, insert, schedule run and deadline
+  M-->>B: generationId (the subscription has already updated the UI)
+  M->>A: runner.start
+  A->>P: start job with a signed webhook URL
+  A->>M: markRunning(provider, externalJobId)
+  P->>A: webhook (HTTP action)
+  A->>M: store the payload, schedule processing
+  A-->>P: 200
+  M->>A: copy outputs and thumbnails
+  A->>R: store images
+  A->>M: settleGeneration(outcome)
+  M->>M: final state, refund if needed, start the next waiting job
 ```
 
-## 2. Decisions and what I considered
+The page subscribes to the workspace's generations and balance, so every step above shows up without polling.
+
+## 2. Decisions
 
 | Decision | Chosen | Considered | Why |
 |---|---|---|---|
-| Backend and database | Convex | Postgres (Neon or Supabase) with a job queue (Inngest, Trigger.dev) and a realtime layer (SSE, Supabase Realtime) | Mutations are serializable transactions, so the balance check and the debit can't race. Queries are live subscriptions, which covers "updating live" with no extra code. A function scheduled from a mutation only runs if the mutation commits, so the database, the queue and the realtime layer are one system. The cost is weaker SQL reporting, so usage data goes to an analytics store. I haven't run Convex in production; this follows its docs. |
-| Where the balance lives | A `creditBalance` field on the user plus an append-only ledger, written in the same mutation | Summing the ledger on every read; one row per credit | Reading the balance stays cheap and the ledger is the audit trail. A nightly job checks that they agree. |
-| When to charge | Debit at submit, refund on failure | Charge only on success; a separate "reserved" balance | Debiting first means two tabs can't spend the same credits, and the user sees the cost right away. A reserved balance adds a state without changing what the user sees. |
-| Where prices live | Typed model definitions in code, shared by client and server, plus a kill switch in the database | A pricing table with an admin UI | Price changes go through review and tests. The urgent case, turning a model or provider off, needs no deploy. An admin UI can come once prices change often. |
-| Getting the result | Provider webhook, with a watchdog that polls as a fallback | An action that polls until the job is done | An action that polls holds a worker for up to 150 seconds per job. The watchdog covers webhooks that never arrive. |
-| Storage | Cloudflare R2 | Convex file storage, S3 | Generated images get viewed many times, and R2 has no egress fees. It speaks the S3 API and supports presigned uploads. |
-| Providers | An ordered list per model, one adapter per provider | One provider per model | A fallback keeps generations working through an outage, and the adapter keeps each provider's quirks out of the core flow. |
+| Backend | Convex | Postgres + a job queue + a realtime layer | Mutations are serializable transactions, queries are live, and a function scheduled from a mutation runs only if the mutation commits. One system covers all three. I haven't run Convex in production; this follows its docs, and the code deploys to a local Convex backend. |
+| Who owns credits | The workspace | The user | Rendair's plans have members and a shared pool. |
+| Balance | A cached `creditBalance` plus an append-only ledger, written together | Summing the ledger on every read | Reading the balance stays cheap and the ledger is the audit trail. A nightly job checks that they agree. |
+| When to charge | Debit at submit, refund on failure | Charge on success | Two tabs can't spend the same credits, and the user sees the cost right away. |
+| Deadline | Scheduled by the submit mutation | Scheduled by the runner action | Actions run at most once. If the runner crashes, a deadline it was supposed to schedule never exists. One scheduled by the mutation is guaranteed to run. |
+| Routing | Own GPU first, external overflow, per-provider concurrency | One fixed provider per model | Our GPUs cost less per job, and external providers add capacity when ours are full or down. |
+| Prices | Typed definitions in code, shared with the client | A pricing table with an admin UI | Price changes get review and tests; a model can still be switched off without a deploy. |
+| Storage | A private Cloudflare R2 bucket behind a Worker that checks the viewer's workspace | Convex file storage, public URLs | No egress fees for images viewed many times. Rendair promises that files stay private. |
 
 ## 3. Data model
 
-The full schema with validators is in [`convex/schema.ts`](convex/schema.ts).
+Full schema: [`convex/schema.ts`](convex/schema.ts).
 
-| Table | Fields | Indexes |
+| Table | Key fields | Indexes |
 |---|---|---|
-| `users` | `tokenIdentifier`, `creditBalance` | `by_token` |
-| `creditLedger` | `userId`, `amount` (signed), `kind` (`purchase`, `generation_debit`, `generation_refund`, `adjustment`), `generationId?`, `ref` | `by_user`, `by_generation_kind` |
-| `uploads` | `userId`, `r2Key`, `contentType`, `sizeBytes` | `by_user` |
-| `generations` | `userId`, `clientRequestId`, `modelId`, `pricingVersion`, `params`, `prompt`, `inputUploadIds`, `imagesRequested`, `priceCredits`, `status`, `attempt`, `provider?`, `externalJobId?`, `error?`, `outputs`, `startedAt?`, `finishedAt?`, `deadlineAt?` | `by_user`, `by_user_request`, `by_user_status`, `by_external`, `by_status_deadline` |
-| `modelFlags` | `key` (`model:photoreal`, `provider:fal`), `enabled`, `reason?` | `by_key` |
+| `workspaces` | `plan`, `creditBalance`, `isInternal?`, `limitOverrides?` | |
+| `users` | `tokenIdentifier`, `workspaceId` | `by_token` |
+| `creditLedger` | `workspaceId`, `userId?`, `amount`, `kind`, `generationId?`, `ref` | `by_workspace`, `by_ref` |
+| `generations` | `workspaceId`, `userId`, `clientRequestId`, `modelId`, `params`, `priceCredits`, `imagesRequested`, `priority`, `status`, `attempt`, `provider?`, `externalJobId?`, `error?`, `outputs`, `costUsd?`, `deadlineAt?` | `by_user_request`, `by_workspace_status`, `by_status_deadline` |
+| `uploads` | `workspaceId`, `userId`, `r2Key`, `contentType`, `sizeBytes` | `by_workspace` |
+| `modelFlags` | `key` (`model:render`, `provider:own-gpu`), `state` (`on`, `internal`, `off`) | `by_key` |
 
-Every index exists for a query: `by_user_request` makes submit idempotent, `by_user_status` counts open generations, `by_external` finds a generation from a webhook, `by_status_deadline` feeds the watchdog sweep, and `by_generation_kind` makes the refund happen at most once.
-
-A generation moves through these states. `succeeded`, `partial` and `failed` are final.
+Ledger kinds are `plan_renewal`, `seat_grant`, `top_up`, `generation_debit`, `generation_refund`, `chargeback` and `adjustment`. `ref` is unique by construction: a Stripe invoice or checkout session id, or `generation:<id>:debit` / `:refund`.
 
 ```mermaid
 stateDiagram-v2
   [*] --> queued: a slot is free
-  [*] --> waiting: 4 already active
+  [*] --> waiting: every slot is busy
   waiting --> queued: a slot frees up
-  queued --> running: provider accepted the job
-  running --> queued: retryable error, next provider
+  waiting --> cancelled: user cancels (full refund)
+  queued --> running: provider accepted
+  running --> queued: retryable error, next attempt
   running --> succeeded
-  running --> partial: fewer images than asked for
-  running --> failed: not retryable, out of attempts, or past the deadline
-  queued --> failed: no provider available
+  running --> partial: fewer images than asked
+  running --> failed: not retryable, out of attempts
+  queued --> failed: deadline
+  running --> failed: deadline
 ```
 
-Three rules hold at all times, and the tests check the first after every case:
+Rules that always hold, checked after every test:
 
-- For every user, `creditBalance >= 0` and `creditBalance` equals the sum of their ledger entries.
-- A generation has exactly one `generation_debit` and at most one `generation_refund`.
-- Only `settle` moves a generation into a final state, and nothing moves it out.
+- Each workspace's `creditBalance` equals the sum of its ledger entries. Spending never takes it below zero; only a chargeback can.
+- A generation has at most one debit and at most one refund.
+- Final states (`succeeded`, `partial`, `failed`, `cancelled`) never change.
 
 ## 4. Models and pricing
 
-Each model is one definition in [`shared/models/catalog.ts`](shared/models/catalog.ts): an id, its providers in order of preference, how many input images it takes, its typical duration, a Zod schema for its parameters, and a price per image. The repo has two example models with different parameters, providers and input rules:
+Each model is one definition in [`shared/models/catalog.ts`](shared/models/catalog.ts): providers in order of preference, whether a prompt is required, how many input images it takes, its median duration, a Zod schema for its parameters, and a price per image. One schema drives validation, price and the params form, and `pricingVersion` is stored on each generation. The two examples follow Rendair's rough rates of about 1 credit per image and 5 per upscale:
 
 | Model | Parameters | Credits per image |
 |---|---|---|
-| `photoreal` (fal, then Replicate) | quality, resolution, aspect ratio, count | draft 2, standard 4, high 8; plus 0 / 2 / 6 for 1k / 2k / 4k |
-| `sketch-render` (own GPU) | style, sketch strength, resolution, count; needs one input image | 3 at 1k, 5 at 2k |
+| `render` (fal, then Replicate) | quality, resolution, aspect ratio, count 1 to 4; optional input images | standard 1, high 2; plus 0 / 1 / 3 for 1k / 2k / 4k |
+| `upscale` (own GPU, then fal) | factor; exactly one input image, no prompt | 2x: 5, 4x: 10 |
 
-`model.quote(params)` validates the parameters, fills in defaults and returns the price. The params form in the UI is generated from the same schema, so adding a model doesn't need new form code. The client sends the price it showed as `expectedPriceCredits`. If the server's price is different, for example because prices changed after the page loaded, submit fails with `PRICE_CHANGED` and returns the new price, so the user never pays more than the button said. `pricingVersion` is stored on each generation so old ones can be explained later.
+The client sends the price it showed as `expectedPriceCredits`. If the server's price differs, submit fails with `PRICE_CHANGED` and the new price, so nobody pays more than the button said.
 
 ## 5. Flows
 
 ### Submit
 
-`submitGeneration` runs these steps in one transaction. Section 11 explains why this is the critical function.
+[`submitGeneration`](convex/generations.ts) does all of this in one transaction:
 
-1. Find the user from the auth identity.
-2. If this user already has a generation with this `clientRequestId`, return it. A double click or a network retry doesn't charge twice.
-3. Check that the model exists and that the model and at least one of its providers are switched on.
-4. Validate the parameters, the prompt and the input images. Each upload must belong to this user.
-5. Compute the price and compare it with `expectedPriceCredits`.
-6. Check the balance.
-7. Count the user's open generations. With fewer than 4 active and nobody waiting, the new one is `queued`. With fewer than 24 open in total, it is `waiting`. Otherwise it fails with `TOO_MANY_PENDING`.
-8. Insert the generation, lower the balance, write the debit to the ledger, and schedule `runner.start` if it is `queued`.
+1. Load the member and their workspace. A repeated `clientRequestId` returns the existing generation, so a double click or a network retry doesn't charge twice.
+2. Check that the model and at least one of its providers are on for this workspace. A flag can be `internal`, for rollout to our own team.
+3. Validate params, prompt and input images (each upload must belong to the workspace), then compare prices.
+4. Check the balance. A parallel submit reads the same balance, so Convex reruns one of them.
+5. Start any waiting jobs that fit in free slots. If a promotion was ever missed, this repairs the line.
+6. Admit the job: `queued` if a render slot is free and nobody is waiting, `waiting` if the background limit allows, otherwise `TOO_MANY_PENDING`.
+7. Insert it, debit the ledger, and for a queued job schedule `runner.start` and a timed-out `settleGeneration` at `deadlineAt`.
 
 ### Run
 
-The action loads the generation, picks the first provider whose flag is on, creates signed read URLs for the input images, and starts the job with a webhook URL that carries the generation id, the attempt number and an HMAC. It records the provider's job id through `markRunning`, which only accepts a `queued` generation, and schedules the watchdog for the deadline.
+The runner tries the model's providers in order. Own GPU comes first for the models it serves, and the next provider takes the job when the GPUs are full or failing. Each provider has a concurrency limit (GPU count, or the provider's rate limit). When every provider is full, queued jobs wait in a dispatch order of plan priority, then age, using an index on `priority` and creation time (build step 4). That is Rendair's "your jobs start first when it is busy". The runner gives each attempt its own timeout of 3x the model's median duration, so one stuck provider doesn't use up the whole deadline. It creates signed read URLs for the inputs, starts the job, and records it with `markRunning`.
 
-### Settle
+### Webhook and settle
 
-The webhook checks the signature, schedules an action and answers 200 at once, so the provider never waits on our upload. The action copies the outputs into R2 and calls `settle`. `settle` exits without changes if the generation is already final or if the attempt number is old, so duplicate webhooks, late webhooks and a provider we already gave up on change nothing. On success it stores the outputs. On partial success it refunds the missing images (`priceCredits / imagesRequested` each). On failure it refunds everything, and a refund only happens if `by_generation_kind` shows none yet. In the same transaction it promotes the user's oldest `waiting` generation to `queued`, gives it a deadline and schedules its run.
+The webhook URL is `/webhooks/<provider>?generation=<id>&attempt=<n>&sig=<HMAC>`. The HTTP action checks the signature, stores the raw payload through a mutation (a `webhookEvents` table, build step 2), schedules processing and answers 200, so nothing is lost if processing fails. Processing copies the outputs into R2, makes a 512 px thumbnail, and calls [`settleGeneration`](convex/settle.ts):
 
-### Retry and fallback
+- A final generation, or an outcome from an old attempt, is ignored. Duplicate and late webhooks change nothing.
+- A retryable error before the deadline moves the job back to `queued` with `attempt + 1`, at most 3 attempts.
+- Otherwise it stores outputs and cost, refunds missing images through `by_ref` (at most once), and starts the oldest waiting job.
+- At the deadline the same function fails the job if it is still queued or running, and refunds it. The runner also cancels the job at the provider where its API allows.
 
-Retryable errors (5xx, capacity, rate limits) put the generation back to `queued` with `attempt + 1` and the next provider: at most 3 attempts, and only before the deadline. Errors that won't change on retry, like a safety refusal or a bad input, fail and refund immediately.
+### Billing
 
-### Watchdog
-
-Each run schedules one, and a cron sweeps `by_status_deadline` every minute in case a scheduled function was lost. If a generation is still running past its deadline, the watchdog asks the provider once. If the result is ready it settles it; otherwise it fails the generation, refunds, and cancels the job where the provider's API allows it.
-
-### Uploads
-
-An action returns a presigned PUT URL and a key. The browser uploads straight to R2. A second action checks the object's size and type with a HEAD request and only then records it in `uploads`. Submit accepts upload ids, never raw URLs.
+Stripe webhooks become ledger entries, each keyed by Stripe's own id so a redelivery is a no-op. `invoice.paid` becomes `plan_renewal` (keyed by the invoice) plus `seat_grant` for extra seats (keyed by the invoice line). `checkout.session.completed` becomes `top_up`. A refund or dispute becomes a `chargeback` for the credits bought. If they were already spent, the balance goes negative, which blocks new submits until it's back above the price, and the reconcile job flags it.
 
 ## 6. Frontend and UX
 
-The page is `app/(app)/generate/page.tsx`. A server component renders the layout and preloads the balance and the first page of generations with `preloadQuery`, so the first paint already has data. The form and the gallery are client components on `usePreloadedQuery` and `usePaginatedQuery`.
+The generate page (`app/(app)/generate/page.tsx`) is a server component that preloads the balance and the first page of generations with `preloadQuery`; the form and gallery are client components on `usePreloadedQuery` and `usePaginatedQuery`.
 
-Model cards show the lowest price ("from 4 credits"), and the params form below them is generated from the model's schema. Uploads start as soon as files are dropped, so they have usually finished by the time the user clicks Generate.
+Before submit, the params form is generated from the model's schema and the button reads "Generate · 3 credits", priced with the same `quote` as the server. Images are resized to the model's maximum input size in the browser and start uploading as soon as they are dropped. With too few credits the button is disabled and a "Buy credits" link sits next to it.
 
-The button reads "Generate · 8 credits" and updates as parameters change, using the same `quote` as the server. Without enough credits it is disabled, with a "Buy credits" link next to it.
+After submit, an optimistic update adds the card and lowers the balance before the server answers. A waiting card shows its place in line ("2nd, starts in about 30 s", from the model's median) and a Cancel button that refunds right away. A running card shows elapsed time and a progress bar based on the median, since most providers don't report progress. When a job finishes in a hidden tab, the tab title shows a count and an optional browser notification fires.
 
-To make it feel fast, the mutation is wrapped in an optimistic update: a placeholder card appears and the balance drops before the server answers. Cards then show elapsed time and a progress bar based on the model's typical duration, since most providers don't report progress.
+A failed card says what happened in plain words from the error table below, shows "3 credits refunded", and offers Retry with the same settings. A finished image offers Upscale, Use as input, and Variations with the same seed for consistent views. All of these are new generations with their own price. The gallery shows thumbnails, opens the original on click, and filters by status and board.
 
-A failed card says what went wrong in plain words ("The provider rejected this prompt", "This took too long and was stopped"), shows "8 credits refunded", and has a Retry button that keeps the same settings. Each error code from the server maps to one message.
+## 7. What a teammate needs
 
-The gallery lists newest first, loads more on scroll, and filters by status. Output images are served from R2's CDN domain under keys with a random part.
+The provider adapter, in [`shared/providers/types.ts`](shared/providers/types.ts):
 
-## 7. Folder structure
+```ts
+interface ProviderAdapter {
+  id: "fal" | "replicate" | "own-gpu";
+  maxConcurrentJobs: number;
+  start(job: StartJob): Promise<{ externalJobId: string }>;
+  parseWebhook(body: unknown): ProviderResult;
+  poll(externalJobId: string): Promise<ProviderResult>;
+  cancel?(externalJobId: string): Promise<void>;
+}
+```
+
+Generation errors, in [`shared/providers/errors.ts`](shared/providers/errors.ts). The UI shows the message; settle reads `retryable`.
+
+| Code | Retry | Code | Retry |
+|---|---|---|---|
+| `PROVIDER_ERROR` | yes | `STORAGE_FAILED` | yes |
+| `PROVIDER_BUSY` | yes | `SAFETY_REFUSAL` | no |
+| `RATE_LIMITED` | yes | `INVALID_INPUT` | no |
+| `NO_OUTPUT` | yes | `TIMED_OUT` | no |
+
+Submit errors are `ConvexError`s with a `code` and the data the UI needs, for example `{ code: "PRICE_CHANGED", priceCredits: 3 }` ([`convex/lib/errors.ts`](convex/lib/errors.ts)).
+
+`generations.listMine` returns pages of `{ _id, status, modelId, prompt, priceCredits, imagesRequested, outputs: { thumbUrl, url }[], error?, queuePosition?, _creationTime }`. The URLs point at the Worker in front of R2.
+
+### Folder structure
 
 ```
-app/(app)/generate/
-  page.tsx
-  _components/  ModelPicker  ParamsForm  PromptInput  ImageDropzone
-                GenerateButton  GenerationGrid  GenerationCard  BalanceBadge
+app/(app)/generate/            page.tsx, _components/ (ModelPicker, ParamsForm, Dropzone,
+                               GenerateButton, GenerationGrid, GenerationCard, BalanceBadge)
 convex/
-  schema.ts
-  generations.ts           submitGeneration, listMine, get
-  generationsInternal.ts   markRunning, settle, requeue, startNextWaiting
-  runner.ts                start, watchdog, sweep (actions)
-  credits.ts               refund, grant, reconcile
-  uploads.ts               createUploadUrl, finishUpload
-  http.ts                  provider and Stripe webhooks
-  crons.ts
-  lib/                     auth, errors
+  schema.ts                    in this repo
+  generations.ts               submitGeneration, cancelGeneration (in repo); listMine
+  settle.ts                    settleGeneration (in repo)
+  lib/                         auth, credits, queue, errors (in repo)
+  runner.ts                    start, markRunning, poll (stub in repo)
+  uploads.ts  http.ts  billing.ts  crons.ts
 shared/
-  models/                  definitions, parameter schemas, quote()
-  providers/               adapter interface, one file per provider, own GPU included
-  limits.ts
+  models/  plans.ts  limits.ts  providers/types.ts, errors.ts (in repo); providers/<adapter>.ts
+tests/                         in repo
 ```
 
-Of this tree, the repo contains the schema, `generations.ts` with `submitGeneration` only, `lib/`, `shared/models/`, `shared/limits.ts` and the tests.
+### Build order
 
-## 8. Infrastructure and deployment
+Each step ships behind a model flag set to `internal` first.
 
-- Next.js on Vercel. Convex Cloud with dev, preview (one per pull request) and production deployments. One R2 bucket per environment.
-- Provider API keys and the webhook HMAC secret are Convex environment variables.
-- Our own GPUs sit behind an HTTPS endpoint with the same contract as an external provider: start a job, call our webhook when done. Scaling the GPU pool is out of scope here.
-- Rollout: each model ships behind its flag, to internal accounts first, then to everyone. Any model or provider can be turned off in `modelFlags` without a deploy.
-- A daily job deletes R2 objects that no generation or upload references, such as outputs copied twice because of a duplicate webhook.
+1. Schema, ledger, submit, settle, cancel (this repo).
+2. Runner, webhook and R2 copy with one external provider; a fake adapter for tests.
+3. Generate page and gallery with live updates, optimistic cards and error messages.
+4. Own-GPU adapter, routing, per-provider limits, priority and fallback.
+5. Uploads with resizing, thumbnails, notifications, and the actions on finished images.
+6. Stripe webhooks into the ledger, dashboards, alerts and the nightly reconcile. Then flags go to `on`.
 
-## 9. Testing
+## 8. Testing
 
-What this repo tests (`npm test`):
+The repo has 41 tests (`npm test`): pricing tables, every rule in submit and cancel, and settle's success, partial, failure, retry, stale-attempt, deadline and promotion cases. Every Convex test ends with a check that each workspace's balance equals its ledger. To make sure the tests catch real bugs, I removed five rules one at a time (dedupe by `ref`, the deadline schedule, the self-repair in submit, the stale-attempt check and idempotent submit) and a test failed each time.
 
-- Pricing as tables: parameters in, credits out, for both models, plus parameters that must be rejected.
-- `submitGeneration` with [convex-test](https://github.com/get-convex/convex-test): the debit and the ledger entry, a repeated `clientRequestId`, a stale price, a short balance, spending down to zero, the 4 active / 24 open limits, the waiting line keeping its order, another user's upload, a missing input image, unknown parameters, switched-off models and providers, an empty prompt and a caller without an account.
-- Every test ends by checking that the balance equals the ledger sum.
-- I checked that the tests catch real bugs by removing the idempotency check and the waiting-line rule one at a time. The matching test failed each time.
+What it doesn't cover: convex-test runs mutations one at a time, so two racing submits are Convex's guarantee, not shown here. Next would be a script against a dev deployment that fires parallel submits and settles and then compares the ledger, plus the runner and webhook tested with the fake adapter.
 
-What it doesn't test: convex-test runs mutations one at a time, so it can't show two submits racing. That guarantee comes from Convex's transactions. In the real project I'd add a script for a dev deployment that fires parallel submits and settles and then checks the ledger.
+## 9. In production
 
-Next to add with the rest of the feature: `settle` with a fake provider adapter that can succeed, fail, time out or call back twice (duplicate and late webhooks, partial refunds, the deadline), and an end-to-end smoke test against that fake provider on every preview deployment.
+- Dashboards: generations by status, model and provider; p50 and p95 time to result; time waiting; retry, fallback and refund rates; provider cost (`costUsd`) against credits charged.
+- Alerts: a provider under 90% success for 10 minutes (the runner skips it automatically, and someone is paged); any generation open past its deadline; any reconcile mismatch, which pages right away.
+- Nightly reconcile: balance against ledger for each workspace, and negative balances.
+- Structured logs carry the generation id from submit to webhook; errors go to Sentry.
+- Deploys: Vercel for Next.js; Convex dev, preview (one per pull request) and production deployments; an R2 bucket per environment; provider keys and the webhook secret as Convex environment variables. A daily job deletes R2 objects nothing references.
 
-## 10. Knowing it works in production
+## 10. The critical function
 
-Dashboards show generations by status, model and provider, the success rate, p50 and p95 time from submit to done, time spent waiting, retry, fallback and refund rates, and provider cost against credits charged.
+The brief asked for one function. I chose [`submitGeneration`](convex/generations.ts) because every rule of the feature meets there: idempotency, server-side pricing, the shared balance, plan limits, flags, and the debit committed together with the run and the deadline. A bug there charges people twice or lets a workspace spend credits it doesn't have, and every later step trusts what submit wrote.
 
-Alerts fire when a provider stays under 90% success for 10 minutes (switch it off and page someone), when any generation is still running past its deadline, and on any reconcile mismatch. The last one pages right away, because it means a balance is wrong.
+The money can still leak after submit, in the async part, so [`settleGeneration`](convex/settle.ts) is in the repo too. It is the only way out of an open state, it ignores anything stale, and it refunds at most once.
 
-A nightly reconcile compares each user's balance with their ledger sum, and looks for debits whose generation never reached a final state and for refunds without a failed or partial generation.
+## 11. Left out, and questions for you
 
-Logs are structured and carry the generation id on every line from submit to webhook. Errors from the browser and from actions go to Sentry.
+Not in this version: video (same flow with a different median and price), credit expiry, team admin and per-member spending limits, cancelling a running job, a moderation check before submit, and an admin refund screen.
 
-## 11. The critical function
+Questions the pricing page doesn't answer:
 
-[`submitGeneration`](convex/generations.ts) is where money moves, and every rule of the feature meets there: idempotency, server-side pricing, the balance check, the concurrency limit, and the debit, generation and scheduled run committing together. A bug in the runner or the webhook can be retried. A bug here charges users twice or lets them spend credits they don't have. `settle` came second; its main job is refunding at most once, and the final-state check plus the refund lookup cover that.
-
-Every check that only reads runs before the first write. A thrown error rolls back the whole mutation anyway, but this order keeps the function easy to follow. Errors are `ConvexError`s with a `code` and the data the UI needs, such as the current price for `PRICE_CHANGED`.
-
-The user document and the open-generation counts are read inside the transaction. A second submit from another tab reads the same values, so Convex reruns one of them against the new balance. Scheduling the run inside the mutation means there is never a debit without a job, or a job without a debit.
-
-## 12. Left out, and what I'd ask you
-
-Not in this version: video, team credit pools, credit expiry, priority by plan, cancelling a running generation, a moderation check before submit, and an admin refund screen.
-
-Questions whose answers would change the plan:
-
-1. Should a team's members share one credit balance? If yes, `creditBalance` moves to a workspace, and with many members submitting at once that document needs sharding.
-2. Do credits expire, for example monthly plan credits? Then the ledger needs lots with expiry dates, spent oldest first.
-3. When a user complains about an image they did get, what does support usually do today?
+1. Do the members included in a plan (2 on Pro, 5 on Studio Pro) add credits, or only extra seats?
+2. What happens to rolled-over credits on a downgrade or cancellation?
+3. After a chargeback on spent credits, do you block the workspace or absorb the loss?
 
 ## About this repo
 
-- `convex/_generated` was written by hand to match what `npx convex codegen` produces, because codegen needs a Convex deployment. Running `npx convex dev` replaces it.
-- `convex/runner.ts` is a stub so the scheduled call typechecks. The runner is planned in section 5.
+- `convex/_generated` comes from `npm run convex:local`, which pushes the schema and functions to a local Convex backend (`CONVEX_AGENT_MODE=anonymous`, no account).
+- `convex/runner.ts` is a stub that throws, so the scheduled call typechecks. One test uses that: the runner crashes and the deadline still refunds.
