@@ -24,6 +24,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   await expectEveryBalanceMatchesItsLedger(t);
+  vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
@@ -97,13 +98,15 @@ describe("settleGeneration", () => {
     expect(await balanceOf(t, member.workspaceId)).toBe(20);
   });
 
-  test("a run that never starts is failed and refunded at its deadline", async () => {
+  test("a run that crashes before reaching a provider is failed and refunded at its deadline", async () => {
+    const crashes = vi.spyOn(console, "error").mockImplementation(() => {});
     const member = await signUp(t, { credits: 20 });
     const { generationId } = await submit(member);
 
     vi.advanceTimersByTime(GENERATION_DEADLINE_MS + 1);
     await t.finishAllScheduledFunctions(vi.runAllTimers);
 
+    expect(crashes.mock.calls.flat().join(" ")).toContain("runner:start");
     expect(await getGeneration(t, generationId)).toMatchObject({
       status: "failed",
       error: { code: "TIMED_OUT" },
@@ -113,7 +116,7 @@ describe("settleGeneration", () => {
 
   test("a result that arrives after the deadline is ignored", async () => {
     const { member, generationId } = await runningGeneration();
-    vi.advanceTimersByTime(GENERATION_DEADLINE_MS + 1);
+    vi.setSystemTime(Date.now() + GENERATION_DEADLINE_MS + 1);
     await settle(t, generationId, { kind: "timed_out" });
 
     expect(await settle(t, generationId, { kind: "succeeded", attempt: 0, outputs: outputs(1) })).toBe("ignored");
