@@ -4,7 +4,7 @@ import {
   balanceOf,
   createHarness,
   createWorkspace,
-  expectEveryBalanceMatchesItsLedger,
+  expectLedgerInvariants,
   ledgerOf,
   type Harness,
 } from "./harness";
@@ -16,7 +16,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  await expectEveryBalanceMatchesItsLedger(t);
+  await expectLedgerInvariants(t);
 });
 
 test("a redelivered Stripe invoice grants its credits once", async () => {

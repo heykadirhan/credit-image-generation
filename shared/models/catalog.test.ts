@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { models, render, upscale } from "./catalog";
+import { models, render, textToImage, upscale } from "./catalog";
 
 describe("render pricing", () => {
   test.each([
@@ -35,6 +35,13 @@ describe("upscale pricing", () => {
 
   test("always makes one image", () => {
     expect(upscale.quote({ count: 2 }).ok).toBe(false);
+  });
+});
+
+describe("text-to-image pricing", () => {
+  test("is free for any number of images", () => {
+    const quote = textToImage.quote({ count: 4 });
+    expect(quote.ok && quote.priceCredits).toBe(0);
   });
 });
 

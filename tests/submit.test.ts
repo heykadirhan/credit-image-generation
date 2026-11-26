@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api } from "../convex/_generated/api";
+import { MAX_PROMPT_LENGTH } from "../shared/limits";
 import {
   addMember,
   addUpload,
@@ -7,7 +8,7 @@ import {
   createHarness,
   createWorkspace,
   errorOf,
-  expectEveryBalanceMatchesItsLedger,
+  expectLedgerInvariants,
   generationsOf,
   getGeneration,
   ledgerOf,
@@ -26,7 +27,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  await expectEveryBalanceMatchesItsLedger(t);
+  await expectLedgerInvariants(t);
   vi.useRealTimers();
 });
 
@@ -96,6 +97,18 @@ describe("submitGeneration: credits", () => {
 
     expect(error.code).toBe("INSUFFICIENT_CREDITS");
     expect(await balanceOf(t, workspaceId)).toBe(0);
+  });
+
+  test("a free model takes a render slot but writes no ledger entry", async () => {
+    const member = await signUp(t, { plan: "starter" });
+    const free = { modelId: "text-to-image", expectedPriceCredits: 0 };
+
+    const first = await submit(member, free);
+    const second = await submit(member, free);
+
+    expect(first).toMatchObject({ status: "queued", priceCredits: 0, balanceAfter: 0 });
+    expect(second.status).toBe("waiting");
+    expect(await ledgerOf(t, member.workspaceId)).toHaveLength(0);
   });
 });
 
@@ -169,11 +182,24 @@ describe("submitGeneration: input checks", () => {
     expect(result).toMatchObject({ status: "queued", balanceAfter: 15 });
   });
 
-  test("rejects params the model doesn't have, and an empty render prompt", async () => {
+  test("render takes one to four different images", async () => {
     const member = await signUp(t, { credits: 20 });
 
+    const none = await errorOf(submit(member, { inputUploadIds: [] }));
+    const twice = await errorOf(submit(member, { inputUploadIds: [member.sketchId, member.sketchId] }));
+
+    expect(none).toEqual({ code: "INVALID_INPUT_IMAGES", min: 1, max: 4 });
+    expect(twice.code).toBe("INVALID_INPUT_IMAGES");
+  });
+
+  test("rejects an unknown model, params the model doesn't have, and an empty or overlong prompt", async () => {
+    const member = await signUp(t, { credits: 20 });
+    const overlong = "x".repeat(MAX_PROMPT_LENGTH + 1);
+
+    expect((await errorOf(submit(member, { modelId: "video" }))).code).toBe("UNKNOWN_MODEL");
     expect((await errorOf(submit(member, { params: { factor: "2x" } }))).code).toBe("INVALID_PARAMS");
     expect((await errorOf(submit(member, { prompt: "  " }))).code).toBe("INVALID_PROMPT");
+    expect((await errorOf(submit(member, { prompt: overlong }))).code).toBe("INVALID_PROMPT");
   });
 
   test("refuses a caller without an account", async () => {
@@ -197,6 +223,24 @@ describe("cancelGeneration", () => {
     expect(await cancel(started.generationId)).toBe("too_late");
     expect((await getGeneration(t, waiting.generationId)).status).toBe("cancelled");
     expect(await balanceOf(t, member.workspaceId)).toBe(19);
+  });
+
+  test("a teammate can cancel a waiting job, and the refund goes to whoever submitted it", async () => {
+    const workspaceId = await createWorkspace(t, { plan: "starter", credits: 20 });
+    const anna = await addMember(t, workspaceId);
+    const ben = await addMember(t, workspaceId);
+    await submit(anna);
+    const waiting = await submit(anna);
+
+    const cancelled = await ben.as.mutation(api.generations.cancelGeneration, {
+      generationId: waiting.generationId,
+    });
+
+    expect(cancelled).toBe("cancelled");
+    const refunds = (await ledgerOf(t, workspaceId)).filter((entry) => entry.kind === "generation_refund");
+    expect(refunds).toEqual([
+      expect.objectContaining({ userId: anna.userId, generationId: waiting.generationId }),
+    ]);
   });
 
   test("a member of another workspace can't see or cancel the job", async () => {

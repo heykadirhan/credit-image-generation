@@ -32,7 +32,8 @@ const finalStatuses = new Set(["succeeded", "partial", "failed", "cancelled"]);
 export const settleGeneration = internalMutation({
   args: { generationId: v.id("generations"), outcome: outcomeValidator },
   returns: v.union(v.literal("settled"), v.literal("retrying"), v.literal("ignored")),
-  handler: async (ctx, { generationId, outcome }) => {
+  handler: async (ctx, { generationId, outcome: reported }) => {
+    const outcome = failIfEmpty(reported);
     const generation = await ctx.db.get(generationId);
     if (!generation || finalStatuses.has(generation.status)) return "ignored";
 
@@ -65,7 +66,7 @@ export const settleGeneration = internalMutation({
       outputs,
       finishedAt: now,
       costUsd: outcome.kind === "timed_out" ? generation.costUsd : outcome.costUsd,
-      error: errorFor(outcome, outputs.length),
+      error: errorFor(outcome),
     });
 
     if (missing > 0 && generation.priceCredits > 0) {
@@ -84,18 +85,28 @@ export const settleGeneration = internalMutation({
   },
 });
 
+function failIfEmpty(outcome: Outcome): Outcome {
+  if (outcome.kind !== "succeeded" || outcome.outputs.length > 0) return outcome;
+  return {
+    kind: "failed",
+    attempt: outcome.attempt,
+    code: "NO_OUTPUT",
+    message: generationErrors.NO_OUTPUT.message,
+    costUsd: outcome.costUsd,
+  };
+}
+
 function shouldRetry(generation: Doc<"generations">, outcome: Outcome, now: number) {
   if (outcome.kind !== "failed" || !generationErrors[outcome.code].retryable) return false;
   if (generation.attempt + 1 >= MAX_ATTEMPTS) return false;
   return generation.deadlineAt !== undefined && now < generation.deadlineAt;
 }
 
-function errorFor(outcome: Outcome, delivered: number) {
+function errorFor(outcome: Outcome) {
   if (outcome.kind === "failed") return { code: outcome.code, message: outcome.message };
   if (outcome.kind === "timed_out") {
     return { code: "TIMED_OUT" as const, message: generationErrors.TIMED_OUT.message };
   }
-  if (delivered === 0) return { code: "NO_OUTPUT" as const, message: generationErrors.NO_OUTPUT.message };
   return undefined;
 }
 

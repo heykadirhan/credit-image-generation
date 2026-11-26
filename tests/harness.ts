@@ -53,7 +53,8 @@ export async function addMember(t: Harness, workspaceId: Id<"workspaces">) {
   const tokenIdentifier = `https://auth.test|${subject}`;
   const userId = await t.run((ctx) => ctx.db.insert("users", { tokenIdentifier, workspaceId }));
   const as = t.withIdentity({ subject, issuer: "https://auth.test", tokenIdentifier });
-  return { userId, workspaceId, as };
+  const sketchId = await addUpload(t, { userId, workspaceId });
+  return { userId, workspaceId, as, sketchId };
 }
 
 export type Member = Awaited<ReturnType<typeof addMember>>;
@@ -62,12 +63,15 @@ export async function signUp(t: Harness, options: Parameters<typeof createWorksp
   return addMember(t, await createWorkspace(t, options));
 }
 
-export async function addUpload(t: Harness, member: Member) {
+export async function addUpload(
+  t: Harness,
+  owner: { userId: Id<"users">; workspaceId: Id<"workspaces"> },
+) {
   return t.run((ctx) =>
     ctx.db.insert("uploads", {
-      userId: member.userId,
-      workspaceId: member.workspaceId,
-      r2Key: `uploads/${member.userId}/sketch.png`,
+      userId: owner.userId,
+      workspaceId: owner.workspaceId,
+      r2Key: `uploads/${owner.userId}/sketch.png`,
       contentType: "image/png",
       sizeBytes: 1000,
     }),
@@ -98,7 +102,11 @@ export function submitArgs(overrides: SubmitOverrides = {}) {
 }
 
 export function submit(member: Member, overrides: SubmitOverrides = {}) {
-  return member.as.mutation(api.generations.submitGeneration, submitArgs(overrides));
+  const isRender = (overrides.modelId ?? "render") === "render";
+  return member.as.mutation(
+    api.generations.submitGeneration,
+    submitArgs({ inputUploadIds: isRender ? [member.sketchId] : [], ...overrides }),
+  );
 }
 
 type Outcome = FunctionArgs<typeof internal.settle.settleGeneration>["outcome"];
@@ -165,19 +173,22 @@ export async function scheduledNames(t: Harness) {
   return scheduled.filter((job) => job.state.kind === "pending").map((job) => job.name);
 }
 
-export async function expectEveryBalanceMatchesItsLedger(t: Harness) {
-  const rows = await t.run(async (ctx) => {
-    const workspaces = await ctx.db.query("workspaces").collect();
-    const entries = await ctx.db.query("creditLedger").collect();
-    return workspaces.map((workspace) => ({
-      balance: workspace.creditBalance,
-      ledgerSum: entries
-        .filter((entry) => entry.workspaceId === workspace._id)
-        .reduce((sum, entry) => sum + entry.amount, 0),
-    }));
-  });
-  for (const { balance, ledgerSum } of rows) {
-    expect(balance).toBe(ledgerSum);
-    expect(balance).toBeGreaterThanOrEqual(0);
+export async function expectLedgerInvariants(t: Harness) {
+  const { workspaces, entries } = await t.run(async (ctx) => ({
+    workspaces: await ctx.db.query("workspaces").collect(),
+    entries: await ctx.db.query("creditLedger").collect(),
+  }));
+
+  for (const workspace of workspaces) {
+    const ledgerSum = entries
+      .filter((entry) => entry.workspaceId === workspace._id)
+      .reduce((sum, entry) => sum + entry.amount, 0);
+    expect(workspace.creditBalance).toBe(ledgerSum);
+    expect(workspace.creditBalance).toBeGreaterThanOrEqual(0);
   }
+
+  const generationEntries = entries
+    .filter((entry) => entry.generationId !== undefined)
+    .map((entry) => `${entry.generationId} ${entry.kind}`);
+  expect(generationEntries).toHaveLength(new Set(generationEntries).size);
 }

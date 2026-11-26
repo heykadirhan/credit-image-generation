@@ -4,7 +4,7 @@ This is my plan for the feature in the Rendair case brief, written for the teamm
 
 ```bash
 npm install
-npm test               # 41 tests: pricing, submit, settle, cancel, ledger
+npm test               # 49 tests: pricing, submit, settle, cancel, ledger
 npm run typecheck
 npm run convex:local   # pushes to a local Convex backend, no account needed
 ```
@@ -23,10 +23,10 @@ These follow rendair.ai/pricing where it says something, and are my choices wher
 
 1. Credits belong to the workspace. Members share them, and so do all tools ("credits are shared across every app"). The free plan gets Starter's limits.
 2. Renewals add the plan's credits to what is left. Extra seats add 500 each. Top-ups can be bought any time. Since nothing expires, one balance is enough; if plan credits ever expire, the ledger gets lots with expiry dates.
-3. Credits are whole numbers and the server sets every price. Text-to-image is free on Rendair, so a price of 0 is valid: it goes through the same limits and writes no ledger entry.
+3. Credits are whole numbers and the server sets every price. Text-to-image is free on Rendair, so a price of 0 is valid: `text-to-image` goes through the same limits and writes no ledger entry.
 4. A user hasn't "got a result" until a finished image is stored in our bucket. Provider errors, safety refusals, timeouts and a failed copy all refund. "I don't like the image" goes to support, who can add an `adjustment`.
 5. A generation asks for 1 to 4 images, priced per image. Images that don't arrive are refunded one by one.
-6. A generation that hasn't finished 5 minutes after it starts has failed. That is twice the slowest normal run. A result that arrives later is discarded.
+6. A generation that hasn't finished 5 minutes after it leaves the waiting line has failed, and time spent waiting for a free provider counts. That is twice the slowest normal run (150 s). A result that arrives later is discarded.
 7. Uploads are JPEG, PNG or WebP, at most 4 per generation, resized in the browser before upload.
 
 ## 1. How it works
@@ -99,7 +99,7 @@ stateDiagram-v2
   running --> failed: deadline
 ```
 
-Rules that always hold, checked after every test:
+Rules that always hold. The first two are checked after every Convex test; the third has its own tests (a repeated webhook, a late result, a second cancel):
 
 - Each workspace's `creditBalance` equals the sum of its ledger entries. Spending never takes it below zero; only a chargeback can.
 - A generation has at most one debit and at most one refund.
@@ -107,12 +107,13 @@ Rules that always hold, checked after every test:
 
 ## 4. Models and pricing
 
-Each model is one definition in [`shared/models/catalog.ts`](shared/models/catalog.ts): providers in order of preference, whether a prompt is required, how many input images it takes, its median duration, a Zod schema for its parameters, and a price per image. One schema drives validation, price and the params form, and `pricingVersion` is stored on each generation. The two examples follow Rendair's rough rates of about 1 credit per image and 5 per upscale:
+Each model is one definition in [`shared/models/catalog.ts`](shared/models/catalog.ts): providers in order of preference, whether a prompt is required, how many input images it takes, its median duration, a Zod schema for its parameters, and a price per image. One schema drives validation, price and the params form, and `pricingVersion` is stored on each generation. The three examples follow Rendair's rates: text-to-image is free, a render costs about 1 credit per image and an upscale 5:
 
 | Model | Parameters | Credits per image |
 |---|---|---|
-| `render` (fal, then Replicate) | quality, resolution, aspect ratio, count 1 to 4; optional input images | standard 1, high 2; plus 0 / 1 / 3 for 1k / 2k / 4k |
+| `render` (fal, then Replicate) | quality, resolution, aspect ratio, count 1 to 4; one to four input images | standard 1, high 2; plus 0 / 1 / 3 for 1k / 2k / 4k |
 | `upscale` (own GPU, then fal) | factor; exactly one input image, no prompt | 2x: 5, 4x: 10 |
+| `text-to-image` (fal, then Replicate) | aspect ratio, count 1 to 4; no input images | 0 |
 
 The client sends the price it showed as `expectedPriceCredits`. If the server's price differs, submit fails with `PRICE_CHANGED` and the new price, so nobody pays more than the button said.
 
@@ -132,14 +133,14 @@ The client sends the price it showed as `expectedPriceCredits`. If the server's 
 
 ### Run
 
-The runner tries the model's providers in order. Own GPU comes first for the models it serves, and the next provider takes the job when the GPUs are full or failing. Each provider has a concurrency limit (GPU count, or the provider's rate limit). When every provider is full, queued jobs wait in a dispatch order of plan priority, then age, using an index on `priority` and creation time (build step 4). That is Rendair's "your jobs start first when it is busy". The runner gives each attempt its own timeout of 3x the model's median duration, so one stuck provider doesn't use up the whole deadline. It creates signed read URLs for the inputs, starts the job, and records it with `markRunning`.
+The runner tries the model's providers in order. Own GPU comes first for the models it serves, and the next provider takes the job when the GPUs are full or failing. Each provider has a concurrency limit (GPU count, or the provider's rate limit). When every provider is full, queued jobs wait in a dispatch order of plan priority, then age, using an index on `priority` and creation time (build step 4). That is Rendair's "your jobs start first when it is busy". Time in this line counts toward the deadline, because the user is waiting either way; the "time waiting" dashboard shows it before it turns into timeouts. Each attempt gets its own timeout of 150 s, the slowest normal run, so one stuck provider doesn't use up the whole deadline. When less than that is left, the runner doesn't start another attempt: it settles the job as `TIMED_OUT` right away, so we don't pay a provider for an image we would discard. It creates signed read URLs for the inputs, starts the job, and records it with `markRunning`.
 
 ### Webhook and settle
 
 The webhook URL is `/webhooks/<provider>?generation=<id>&attempt=<n>&sig=<HMAC>`. The HTTP action checks the signature, stores the raw payload through a mutation (a `webhookEvents` table, build step 2), schedules processing and answers 200, so nothing is lost if processing fails. Processing copies the outputs into R2, makes a 512 px thumbnail, and calls [`settleGeneration`](convex/settle.ts):
 
 - A final generation, or an outcome from an old attempt, is ignored. Duplicate and late webhooks change nothing.
-- A retryable error before the deadline moves the job back to `queued` with `attempt + 1`, at most 3 attempts.
+- A retryable error before the deadline moves the job back to `queued` with `attempt + 1`, at most 3 attempts. A result with no images counts as the retryable `NO_OUTPUT`.
 - Otherwise it stores outputs and cost, refunds missing images through `by_ref` (at most once), and starts the oldest waiting job.
 - At the deadline the same function fails the job if it is still queued or running, and refunds it. The runner also cancels the job at the provider where its API allows.
 
@@ -215,7 +216,7 @@ Each step ships behind a model flag set to `internal` first.
 
 ## 8. Testing
 
-The repo has 41 tests (`npm test`): pricing tables, every rule in submit and cancel, and settle's success, partial, failure, retry, stale-attempt, deadline and promotion cases. Every Convex test ends with a check that each workspace's balance equals its ledger. To make sure the tests catch real bugs, I removed five rules one at a time (dedupe by `ref`, the deadline schedule, the self-repair in submit, the stale-attempt check and idempotent submit) and a test failed each time.
+The repo has 49 tests (`npm test`): pricing tables, each check in submit and cancel, and settle's success, partial, empty, failure, retry, stale-attempt, deadline and promotion cases. Every Convex test ends by checking that each workspace's balance equals its ledger and isn't negative, and that no generation has two debits or two refunds. To make sure the tests catch real bugs, I removed 14 rules one at a time, among them dedupe by `ref`, the deadline schedule, the self-repair in submit, the stale-attempt check, idempotent submit and the empty-result retry, and a test failed each time.
 
 What it doesn't cover: convex-test runs mutations one at a time, so two racing submits are Convex's guarantee, not shown here. Next would be a script against a dev deployment that fires parallel submits and settles and then compares the ledger, plus the runner and webhook tested with the fake adapter.
 

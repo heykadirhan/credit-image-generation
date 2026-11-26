@@ -115,7 +115,7 @@ export const cancelGeneration = mutation({
   args: { generationId: v.id("generations") },
   returns: v.union(v.literal("cancelled"), v.literal("too_late")),
   handler: async (ctx, { generationId }) => {
-    const { user, workspace } = await requireMember(ctx);
+    const { workspace } = await requireMember(ctx);
     const generation = await ctx.db.get(generationId);
     if (!generation || generation.workspaceId !== workspace._id) fail("NOT_FOUND");
     if (generation.status !== "waiting") return "too_late";
@@ -124,7 +124,7 @@ export const cancelGeneration = mutation({
     if (generation.priceCredits > 0) {
       await applyLedgerEntryOnce(ctx, {
         workspaceId: workspace._id,
-        userId: user._id,
+        userId: generation.userId,
         amount: generation.priceCredits,
         kind: "generation_refund",
         generationId,

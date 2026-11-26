@@ -3,7 +3,7 @@ import { GENERATION_DEADLINE_MS } from "../shared/limits";
 import {
   balanceOf,
   createHarness,
-  expectEveryBalanceMatchesItsLedger,
+  expectLedgerInvariants,
   getGeneration,
   ledgerOf,
   markRunning,
@@ -23,7 +23,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  await expectEveryBalanceMatchesItsLedger(t);
+  await expectLedgerInvariants(t);
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
@@ -96,6 +96,55 @@ describe("settleGeneration", () => {
     expect(await getGeneration(t, generationId)).toMatchObject({ status: "failed", attempt: 2 });
     expect(refundsIn(await ledgerOf(t, member.workspaceId))).toHaveLength(1);
     expect(await balanceOf(t, member.workspaceId)).toBe(20);
+  });
+
+  test("an empty result is retried as NO_OUTPUT", async () => {
+    const { member, generationId } = await runningGeneration();
+    const empty = (attempt: number) => ({ kind: "succeeded" as const, attempt, outputs: [] });
+
+    expect(await settle(t, generationId, empty(0))).toBe("retrying");
+    await markRunning(t, generationId);
+    expect(await settle(t, generationId, empty(1))).toBe("retrying");
+    await markRunning(t, generationId);
+    expect(await settle(t, generationId, empty(2))).toBe("settled");
+
+    expect(await getGeneration(t, generationId)).toMatchObject({
+      status: "failed",
+      error: { code: "NO_OUTPUT" },
+    });
+    expect(await balanceOf(t, member.workspaceId)).toBe(20);
+  });
+
+  test("images beyond the ones asked for are dropped", async () => {
+    const { member, generationId } = await runningGeneration(1);
+
+    await settle(t, generationId, { kind: "succeeded", attempt: 0, outputs: outputs(3) });
+
+    expect((await getGeneration(t, generationId)).status).toBe("succeeded");
+    expect((await getGeneration(t, generationId)).outputs).toHaveLength(1);
+    expect(await balanceOf(t, member.workspaceId)).toBe(19);
+  });
+
+  test("a retryable error after the deadline fails the job instead of retrying", async () => {
+    const { member, generationId } = await runningGeneration();
+    vi.setSystemTime(Date.now() + GENERATION_DEADLINE_MS + 1);
+
+    const busy = { kind: "failed" as const, attempt: 0, code: "PROVIDER_BUSY" as const, message: "capacity" };
+    expect(await settle(t, generationId, busy)).toBe("settled");
+
+    expect((await getGeneration(t, generationId)).status).toBe("failed");
+    expect(await balanceOf(t, member.workspaceId)).toBe(20);
+  });
+
+  test("a provider result for a job that is still waiting is ignored", async () => {
+    const member = await signUp(t, { plan: "starter", credits: 20 });
+    await submit(member);
+    const waiting = await submit(member);
+
+    const result = { kind: "succeeded" as const, attempt: 0, outputs: outputs(1) };
+    expect(await settle(t, waiting.generationId, result)).toBe("ignored");
+
+    expect((await getGeneration(t, waiting.generationId)).status).toBe("waiting");
   });
 
   test("a run that crashes before reaching a provider is failed and refunded at its deadline", async () => {

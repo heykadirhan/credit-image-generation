@@ -11,7 +11,7 @@ export const render = defineModel({
   pricingVersion: 1,
   providers: ["fal", "replicate"],
   promptRequired: true,
-  minInputImages: 0,
+  minInputImages: 1,
   maxInputImages: 4,
   medianSeconds: 25,
   params: z.strictObject({
@@ -40,7 +40,23 @@ export const upscale = defineModel({
   pricePerImage: ({ factor }) => upscaleFactorCredits[factor],
 });
 
-export const models: readonly Model[] = [render, upscale];
+export const textToImage = defineModel({
+  id: "text-to-image",
+  label: "Text to image",
+  pricingVersion: 1,
+  providers: ["fal", "replicate"],
+  promptRequired: true,
+  minInputImages: 0,
+  maxInputImages: 0,
+  medianSeconds: 25,
+  params: z.strictObject({
+    aspectRatio: z.enum(["1:1", "4:3", "3:2", "16:9"]).default("4:3"),
+    count: z.number().int().min(1).max(4).default(1),
+  }),
+  pricePerImage: () => 0,
+});
+
+export const models: readonly Model[] = [render, upscale, textToImage];
 
 export function findModel(id: string): Model | undefined {
   return models.find((model) => model.id === id);
